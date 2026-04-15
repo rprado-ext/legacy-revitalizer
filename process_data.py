@@ -1,6 +1,15 @@
 None
 import datetime
+import hmac
+import json
+import os
+import tempfile
 from abc import ABC, abstractmethod
+from collections.abc import Callable
+
+
+class PersistenceError(Exception):
+    """Raised when the persistence pipeline fails to save data."""
 
 
 # ---------------------------------------------------------------------------
@@ -35,9 +44,29 @@ class FileStorageBackend(StorageBackend):
         self._filepath = filepath
 
     def save(self, items: list[dict]) -> None:
-        """Serialize items to the configured file using a context manager."""
-        with open(self._filepath, "w") as f:
-            f.write(str(items))
+        """Serialize items to the configured file using an atomic write.
+
+        Writes to a temporary file in the same directory, then replaces the
+        target file in a single OS-level operation. This guarantees the file
+        is never left in a partially-written state if the process is
+        interrupted mid-write. Uses JSON for portable, safe serialization.
+
+        Raises:
+            OSError: If the file cannot be opened or written to (e.g. bad path,
+                     missing directory, full disk, or insufficient permissions).
+        """
+        target_dir = os.path.dirname(os.path.abspath(self._filepath))
+        try:
+            fd, tmp_path = tempfile.mkstemp(dir=target_dir)
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(items, f)
+                os.replace(tmp_path, self._filepath)
+            except OSError:
+                os.unlink(tmp_path)
+                raise
+        except OSError as e:
+            raise OSError(f"Failed to write to '{self._filepath}': {e}") from e
 
 
 class HardcodedCredentialStore(CredentialStore):
@@ -54,13 +83,22 @@ class HardcodedCredentialStore(CredentialStore):
         self._password = password
 
     def is_valid(self, username: str, password: str) -> bool:
-        """Return True only when both username and password match exactly."""
-        return username == self._username and password == self._password
+        """Return True only when both username and password match exactly.
+
+        Uses hmac.compare_digest to prevent timing attacks: evaluation time
+        is constant regardless of where the strings first differ.
+        """
+        usernames_match = hmac.compare_digest(username, self._username)
+        passwords_match = hmac.compare_digest(password, self._password)
+        return usernames_match and passwords_match
 
 
 # ---------------------------------------------------------------------------
 # Domain model
 # ---------------------------------------------------------------------------
+
+_MAX_VALUE_LENGTH = 1000
+
 
 class Item:
     """Represents a single stored item with an id, value, and timestamp.
@@ -88,19 +126,45 @@ class Item:
 # Single-responsibility classes
 # ---------------------------------------------------------------------------
 
+class ItemPersistenceService:
+    """Owns the full persistence pipeline for Item objects. (SRP: persistence only)
+
+    Serializes a collection of Item domain objects into plain dicts and
+    delegates the actual storage operation to the injected StorageBackend.
+    Neither the repository nor the backend needs to know about the other.
+
+    Args:
+        backend (StorageBackend): Storage strategy to write serialized data to.
+    """
+
+    def __init__(self, backend: StorageBackend):
+        self._backend = backend
+
+    def persist(self, items: list["Item"]) -> None:
+        """Serialize items and forward them to the storage backend.
+
+        Raises:
+            PersistenceError: If the backend raises any exception during save.
+        """
+        try:
+            self._backend.save([item.to_dict() for item in items])
+        except Exception as e:
+            raise PersistenceError(f"Could not persist items: {e}") from e
+
+
 class ItemRepository:
     """Manages an in-memory collection of Items. (SRP: data management only)
 
-    All persistence is delegated to the injected StorageBackend, so this
-    class never needs to change when the storage medium changes (OCP).
+    Persistence is fully delegated to the injected ItemPersistenceService,
+    so this class has no knowledge of how or where data is stored.
 
     Args:
-        storage (StorageBackend): Backend used by :meth:`save`.
+        persistence (ItemPersistenceService): Service used by :meth:`save`.
     """
 
-    def __init__(self, storage: StorageBackend):
+    def __init__(self, persistence: ItemPersistenceService):
         self._items: list[Item] = []
-        self._storage = storage
+        self._persistence = persistence
 
     @staticmethod
     def _current_timestamp() -> str:
@@ -108,7 +172,15 @@ class ItemRepository:
         return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     def add(self, value: str) -> None:
-        """Append a new Item with the current timestamp and print confirmation."""
+        """Append a new Item with the current timestamp and print confirmation.
+
+        Raises:
+            ValueError: If value exceeds _MAX_VALUE_LENGTH characters.
+        """
+        if len(value) > _MAX_VALUE_LENGTH:
+            raise ValueError(
+                f"Value too long: {len(value)} characters (max {_MAX_VALUE_LENGTH})."
+            )
         item = Item(len(self._items) + 1, value, self._current_timestamp())
         self._items.append(item)
         print("Added.")
@@ -119,8 +191,12 @@ class ItemRepository:
             print(item)
 
     def save(self) -> None:
-        """Persist all items via the storage backend and print confirmation."""
-        self._storage.save([item.to_dict() for item in self._items])
+        """Persist all items via the persistence service and print confirmation."""
+        try:
+            self._persistence.persist(self._items)
+        except PersistenceError as e:
+            print(f"Error: could not save data. {e}")
+            return
         print("Saved.")
 
 
@@ -151,7 +227,7 @@ class Application:
         self._auth = auth
         self._repository = repository
         # OCP: register new commands here without touching any other method.
-        self._commands: dict[str, callable] = {
+        self._commands: dict[str, Callable[[], None]] = {
             "add": self._handle_add,
             "show": self._repository.show,
             "save": self._repository.save,
@@ -185,9 +261,12 @@ class Application:
                 print(f"Unknown command: {cmd!r}")
 
     def _handle_add(self) -> None:
-        """Prompt for a value and delegate to the repository."""
+        """Prompt for a value, validate it, and delegate to the repository."""
         value = input("Value: ")
-        self._repository.add(value)
+        try:
+            self._repository.add(value)
+        except ValueError as e:
+            print(f"Error: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -196,8 +275,9 @@ class Application:
 
 if __name__ == "__main__":
     storage = FileStorageBackend("data.txt")
+    persistence = ItemPersistenceService(storage)
     credentials = HardcodedCredentialStore("admin", "12345")
-    repository = ItemRepository(storage)
+    repository = ItemRepository(persistence)
     auth = AuthService(credentials)
     app = Application(auth, repository)
     app.run()
